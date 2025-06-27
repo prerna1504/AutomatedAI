@@ -1,0 +1,72 @@
+import json
+import re
+import os
+
+# Questions
+questions = [
+    "Are there any errors in this log?",
+    "Where are errors found in this log?",
+    "What events caused failures in this log?"
+]
+
+# Log directories
+log_dirs = ["logs/passed", "logs/failed"]
+
+# Collect logs
+all_logs = []
+for log_dir in log_dirs:
+    if os.path.exists(log_dir):
+        for log_file in os.listdir(log_dir):
+            with open(os.path.join(log_dir, log_file), "r") as f:
+                log_content = f.read().strip()
+                all_logs.append({"path": os.path.join(log_dir, log_file), "content": log_content})
+
+print(f"Found {len(all_logs)} logs for training")
+
+with open("train.jsonl", "w") as out:
+    for log in all_logs:
+        log_path = log["path"]
+        log_content = log["content"]
+        is_failed = "failed" in log_path.lower()
+
+        if is_failed:
+            parts = re.split(r"ERROR[:\s-]*", log_content, 1, re.IGNORECASE)
+            error_detail = parts[1].strip() if len(parts) > 1 else "Unknown error"
+            json_match = re.search(r"\{.*?\}", log_content, re.DOTALL)
+            if json_match:
+                try:
+                    json_data = json.loads(json_match.group())
+                    error_reason = json_data.get("reason", json_data.get("error_code", "unknown"))
+                    error_detail = error_detail.replace(json_match.group(), "").strip()
+                except json.JSONDecodeError:
+                    error_reason = "unknown"
+            else:
+                error_reason = "unknown"
+            error_text = f"{error_detail} (error: {error_reason})"
+            out.write(json.dumps({
+                "prompt": f"<|user|> Are there any errors in this log?\n\n{log_content} <|end|>",
+                "completion": "Yes, an error occurred."
+            }) + "\n")
+            out.write(json.dumps({
+                "prompt": f"<|user|> Where are errors found in this log?\n\n{log_content} <|end|>",
+                "completion": f"Error found: {error_text}"
+            }) + "\n")
+            out.write(json.dumps({
+                "prompt": f"<|user|> What events caused failures in this log?\n\n{log_content} <|end|>",
+                "completion": f"The failure was caused by: {error_text}"
+            }) + "\n")
+        else:
+            out.write(json.dumps({
+                "prompt": f"<|user|> Are there any errors in this log?\n\n{log_content} <|end|>",
+                "completion": "No errors found."
+            }) + "\n")
+            out.write(json.dumps({
+                "prompt": f"<|user|> Where are errors found in this log?\n\n{log_content} <|end|>",
+                "completion": "No errors found in this log."
+            }) + "\n")
+            out.write(json.dumps({
+                "prompt": f"<|user|> What events caused failures in this log?\n\n{log_content} <|end|>",
+                "completion": "No failures found in this log."
+            }) + "\n")
+
+print("Training data saved to train.jsonl with ~{} pairs".format(len(all_logs) * 3))
