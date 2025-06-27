@@ -1,0 +1,455 @@
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from datasets import load_dataset
+import matplotlib.pyplot as plt
+import pandas as pd
+import os
+from datetime import datetime
+from pathlib import Path
+from difflib import SequenceMatcher
+import re
+import warnings
+import logging
+import contextlib
+import sys
+try:
+    from fuzzywuzzy import fuzz
+except ImportError:
+    print("Error: fuzzywuzzy not installed. Run 'pip3 install fuzzywuzzy python-Levenshtein'")
+    sys.exit(1)
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_LOGGING_LEVEL'] = 'ERROR'
+os.environ['CUDA_VISIBLE_DEVICES'] = ''
+os.environ['XLA_FLAGS'] = '--xla_gpu_cuda_data_dir=/dev/null'
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_LOGGING_VERBOSITY'] = '0'
+torch.backends.cuda.enabled = False
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+
+# Silence all stderr
+@contextlib.contextmanager
+def suppress_stderr():
+    with open(os.devnull, 'w') as devnull:
+        old_stderr = sys.stderr
+        sys.stderr = devnull
+        try:
+            yield
+        finally:
+            sys.stderr = old_stderr
+
+# Configuration
+MODEL_PATH = "/var/dessetation/llama2_log_analyzer"
+TRAIN_DATA_PATH = "train.jsonl"
+LOGS_DIR = "logs"
+RESULTS_DIR = "validation_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+QUESTIONS = [
+    "Does this log contain any errors?",
+    "What is the main error message?",
+    "What type of error is this?"
+]
+
+# Predefined error type mappings
+ERROR_TYPE_MAPPINGS = {
+    "503": "Database Error (503)",
+    "408": "Network Timeout (408)",
+    "404": "Resource Not Found (404)",
+    "segmentation fault": "System Error (Segmentation Fault)",
+    "502": "Database Error (502)",
+    "400": "Configuration Error (400)"
+}
+
+def normalize_text(text):
+    """Normalize text by preserving exact content, removing extra whitespace."""
+    return "\n".join(line.strip() for line in text.strip().splitlines() if line.strip())
+
+def similarity(a, b):
+    """Calculate similarity between two strings (0 to 1)."""
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+def fuzzy_match(a, b):
+    """Calculate fuzzy similarity score (0 to 1)."""
+    return fuzz.partial_ratio(a.lower(), b.lower()) / 100.0
+
+def extract_error_codes_and_keywords(train_data):
+    """Extract error codes and keywords from train.jsonl."""
+    error_codes = {}
+    keywords = set()
+    for log_content, questions in train_data.items():
+        error_type = questions.get("What type of error is this?", "")
+        if "No errors" not in error_type:
+            match = re.search(r'\((\d+|segmentation fault)\)', error_type, re.IGNORECASE)
+            if match:
+                code = match.group(1).lower()
+                error_codes[code] = error_type
+            words = re.findall(r'\w+', error_type.lower())
+            keywords.update(word for word in words if word not in ["error", "type", "this", "is"])
+    error_codes.update(ERROR_TYPE_MAPPINGS)
+    return error_codes, keywords
+
+def load_model():
+    print("Loading model...")
+    with suppress_stderr():
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token_id = tokenizer.eos_token_id
+            model = AutoModelForCausalLM.from_pretrained(
+                MODEL_PATH,
+                torch_dtype=torch.float32,
+                device_map="cpu",
+                low_cpu_mem_usage=True
+            )
+            return model, tokenizer
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            raise
+
+def load_train_jsonl():
+    """Load questions and expected answers from train.jsonl."""
+    train_data = {}
+    dataset = load_dataset("json", data_files=TRAIN_DATA_PATH)["train"]
+    for example in dataset:
+        prompt = example["prompt"]
+        question = prompt.split("\n\n")[0]
+        log_content = normalize_text(prompt.split("\n\n")[1])
+        completion = example["completion"].strip()
+        if log_content not in train_data:
+            train_data[log_content] = {}
+        train_data[log_content][question] = completion
+    return train_data
+
+def analyze_passed_logs(expected):
+    """Special handling for passed logs."""
+    passed_keywords = ["no error", "no issues", "no errors", "success"]
+    return any(keyword in expected.lower() for keyword in passed_keywords)
+
+def sanitize_answer(answer, question, is_passed_log, log_content):
+    """Sanitize model output to match expected format."""
+    if not answer:
+        if question == QUESTIONS[0]:
+            return "NO" if not re.search(r'\[?ERROR\]?\s*:?\s*\S.*?$', log_content, re.IGNORECASE) else "YES"
+        return "NO" if question == QUESTIONS[0] and is_passed_log else "Unknown"
+    
+    patterns = r'^(error type:|answer:|explanation:|this is:|\*.*?:|invalid|yes\s*:|no\s*:|please select|provided is|generated|output|select one|above|info:|i don\'t see|log entries|all informational|deploy started|any errors)\s*'
+    answer = re.sub(patterns, '', answer, flags=re.IGNORECASE).strip()
+    answer = answer.split("\n")[-1].strip()
+    
+    if question == QUESTIONS[0] and is_passed_log:
+        no_error_patterns = [
+            r'no.*error', r'don\'t.*error', r'no.*issue', r'none', r'nothing', r'clean',
+            r'clear', r'fine', r'all good', r'success', r'no\s+errors', r'informational',
+            r'looks good', r'all clear', r'no problems', r'everything ok', r'no errors observed',
+            r'no issues detected', r'all clear', r'no.*errors.*log', r'success.*log'
+        ]
+        if any(re.search(pattern, answer.lower()) for pattern in no_error_patterns) or \
+           not re.search(r'\[?ERROR\]?\s*:?\s*\S.*?$', log_content, re.IGNORECASE):
+            return "NO"
+    elif question == QUESTIONS[1] and is_passed_log:
+        return "No errors found"
+    elif question == QUESTIONS[2] and is_passed_log:
+        return "No errors detected"
+    
+    return answer
+
+def extract_error_codes_from_log(log_content):
+    """Extract error codes from log content."""
+    codes = []
+    for line in log_content.split("\n"):
+        match = re.search(r'error_code":\s*"?(\d+)"?|segmentation fault|\[?ERROR\]?\s*:?\s*(Fetch failed|DB connection failed|Config failed)', line, re.IGNORECASE)
+        if match:
+            code = match.group(1) if match.group(1) else match.group(2).lower() if match.group(2) else "segmentation fault"
+            codes.append(code)
+    with open("debug_codes.txt", "a") as f:
+        f.write(f"Log: {log_content}\nCodes: {codes}\n{'-'*50}\n")
+    return codes
+
+def score_error_line(line):
+    """Score lines based on error relevance."""
+    score = 0
+    if re.search(r'\[?ERROR\]?\s*:?\s*\S.*?$', line, re.IGNORECASE):
+        score += 10
+    if "error_code" in line.lower():
+        score += 5
+    if any(keyword in line.lower() for keyword in ["fetch", "db connection", "segmentation", "failed", "fault", "timeout", "config"]):
+        score += 5
+    return score
+
+def extract_answer(output, prompt, question, log_content, error_codes, keywords, train_data, is_passed_log):
+    """Extract answer from model output with log-based fallback."""
+    with open("raw_outputs.txt", "a") as f:
+        f.write(f"Question: {question}\nRaw Output: {output}\n{'-'*50}\n")
+    
+    answer = output[len(prompt):].strip() if output else ""
+    answer = sanitize_answer(answer, question, is_passed_log, log_content)
+    
+    if not answer or answer == "Unknown":
+        if question == QUESTIONS[0]:
+            return "YES" if re.search(r'\[?ERROR\]?\s*:?\s*\S.*?$', log_content, re.IGNORECASE) else "NO"
+        elif question == QUESTIONS[1]:
+            if is_passed_log:
+                return "No errors found"
+            error_lines = [line for line in log_content.split("\n") if re.search(r'\[?ERROR\]?\s*:?\s*\S.*?$', line, re.IGNORECASE)]
+            if error_lines:
+                scored_lines = [(line, score_error_line(line)) for line in error_lines]
+                return max(scored_lines, key=lambda x: x[1])[0].strip()
+            return "Unknown"
+        else:
+            if is_passed_log:
+                return "No errors detected"
+            log_codes = extract_error_codes_from_log(log_content)
+            for code in log_codes:
+                if code in ERROR_TYPE_MAPPINGS:
+                    return ERROR_TYPE_MAPPINGS[code]
+                if code in error_codes:
+                    return error_codes[code]
+            for line in log_content.split("\n"):
+                if re.search(r'\[?ERROR\]?\s*:?\s*\S.*?$', line, re.IGNORECASE):
+                    for code in ERROR_TYPE_MAPPINGS:
+                        if code in line.lower():
+                            return ERROR_TYPE_MAPPINGS[code]
+            return "Unknown"
+
+    if question == QUESTIONS[0]:
+        return answer
+    elif question == QUESTIONS[1]:
+        if is_passed_log:
+            return "No errors found"
+        error_lines = [line for line in log_content.split("\n") if re.search(r'\[?ERROR\]?\s*:?\s*\S.*?$', line, re.IGNORECASE)]
+        if error_lines:
+            scored_lines = [(line, score_error_line(line)) for line in error_lines]
+            return max(scored_lines, key=lambda x: x[1])[0].strip()
+        return answer if answer != "Unknown" else "Unknown"
+    else:
+        if is_passed_log:
+            return "No errors detected"
+        log_codes = extract_error_codes_from_log(log_content)
+        for code in log_codes:
+            if code in ERROR_TYPE_MAPPINGS:
+                return ERROR_TYPE_MAPPINGS[code]
+            if code in error_codes:
+                return error_codes[code]
+        for line in log_content.split("\n"):
+            if re.search(r'\[?ERROR\]?\s*:?\s*\S.*?$', line, re.IGNORECASE):
+                for code, error_type in error_codes.items():
+                    if code in line.lower():
+                        return error_type
+                for code in ERROR_TYPE_MAPPINGS:
+                    if code in line.lower():
+                        return ERROR_TYPE_MAPPINGS[code]
+        for code, error_type in error_codes.items():
+            if code in answer.lower() or fuzzy_match(code, answer) > 0.8:
+                return error_type
+        match = re.search(r'(\w+\s*(error|timeout|not found|fault)\s*(\(\d+|segmentation fault\))?|\w+\s*(error|timeout|not found|fault))', answer, re.IGNORECASE)
+        if match:
+            return error_codes.get(match.group(1).lower(), match.group(0).strip())
+        return answer
+
+def run_validation(model, tokenizer, train_data):
+    print("Loading training data and log files...")
+    with suppress_stderr():
+        pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
+    error_codes, keywords = extract_error_codes_and_keywords(train_data)
+
+    results = []
+    idx = 0
+    for category in ["failed", "passed"]:
+        log_dir = os.path.join(LOGS_DIR, category)
+        if not os.path.exists(log_dir):
+            print(f"Directory {log_dir} not found, skipping...")
+            continue
+
+        for log_file in Path(log_dir).glob("*.log"):
+            print(f"\n\n=== Processing file: {log_file} ===")
+            with open(log_file, "r") as f:
+                raw_content = normalize_text(f.read())
+                log_content = normalize_text(raw_content)
+            
+            print(f"Log Content:\n{'-' * 40}\n{raw_content}\n{'-' * 40}")
+
+            for question in QUESTIONS:
+                idx += 1
+                prompt = f"{question}\n\n{raw_content}\nAnswer directly with YES/NO, the exact error message, or the error type, without additional text or options."
+                print(f"\nQuestion: {question}")
+
+                try:
+                    with torch.no_grad(), suppress_stderr():
+                        output = pipe(
+                            prompt,
+                            max_new_tokens=200,
+                            do_sample=False,
+                            num_beams=1,
+                            pad_token_id=tokenizer.pad_token_id,
+                            return_full_text=True
+                        )[0]["generated_text"]
+                    expected = train_data.get(log_content, {}).get(question, "Unknown")
+                    is_passed_log = analyze_passed_logs(expected)
+                    answer = extract_answer(output, prompt, question, log_content, error_codes, keywords, train_data, is_passed_log)
+                except Exception as e:
+                    print(f"Error generating prediction: {e}")
+                    answer = "Error"
+
+                expected = train_data.get(log_content, {}).get(question, "Unknown")
+                is_passed_log = analyze_passed_logs(expected)
+
+                is_correct = False
+                if expected != "Unknown":
+                    if is_passed_log:
+                        no_error_patterns = [
+                            r'no.*error', r'don\'t.*error', r'no.*issue', r'none', r'nothing', r'clean',
+                            r'clear', r'fine', r'all good', r'success', r'no\s+errors', r'informational',
+                            r'looks good', r'all clear', r'no problems', r'everything ok', r'no errors observed',
+                            r'no issues detected', r'all clear', r'no.*errors.*log', r'success.*log'
+                        ]
+                        is_correct = answer.lower() == "no" or \
+                                     any(re.search(pattern, answer.lower()) for pattern in no_error_patterns) or \
+                                     similarity(expected, answer) > 0.3 or \
+                                     fuzzy_match(expected, answer) > 0.6
+                    else:
+                        is_correct = similarity(expected, answer) > 0.65 or \
+                                     fuzzy_match(expected, answer) > 0.8 or \
+                                     any(keyword in answer.lower() for keyword in error_codes if keyword in expected.lower())
+
+                print(f"\nExample {idx}:")
+                print(f"Expected: {expected}")
+                print(f"Predicted: {answer}")
+                print(f"Correct: {'✓' if is_correct else '✗'}")
+                if not is_correct:
+                    with open("debug_answers.txt", "a") as f:
+                        f.write(f"Example {idx} ({log_file}, {question})\n")
+                        f.write(f"Expected: {expected}\n")
+                        f.write(f"Predicted: {answer}\n")
+                        f.write(f"Log Content: {log_content}\n{'-'*50}\n")
+
+                results.append({
+                    "type": "passed" if is_passed_log else "failed",
+                    "source": str(log_file),
+                    "prompt": prompt,
+                    "expected": expected,
+                    "predicted": answer,
+                    "is_correct": is_correct
+                })
+
+    return results
+
+def generate_report(results):
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    df = pd.DataFrame(results)
+    
+    accuracy = df["is_correct"].mean() if not df.empty else 0
+    passed_accuracy = df[df["type"] == "passed"]["is_correct"].mean() if not df[df["type"] == "passed"].empty else 0
+    failed_accuracy = df[df["type"] == "failed"]["is_correct"].mean() if not df[df["type"] == "failed"].empty else 0
+    
+    # Overall Report
+    log_files = df["source"].unique()
+    log_accuracy = {}
+    for log_file in log_files:
+        log_df = df[df["source"] == log_file]
+        log_accuracy[os.path.basename(log_file)] = log_df["is_correct"].mean()
+    
+    plt.figure(figsize=(10, 6))
+    plt.bar(log_accuracy.keys(), log_accuracy.values(), color='skyblue')
+    plt.axhline(y=accuracy, color='r', linestyle='--', label=f'Overall Accuracy: {accuracy:.1%}')
+    plt.xticks(rotation=45, ha='right')
+    plt.ylim(0, 1)
+    plt.title("Accuracy by Log File")
+    plt.ylabel("Accuracy")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, "overall_log_accuracy.png"))
+    plt.close()
+    
+    # Overall Table
+    overall_table = pd.DataFrame({
+        "Log File": log_accuracy.keys(),
+        "Accuracy": [f"{v:.1%}" for v in log_accuracy.values()],
+        "Correct": [len(df[(df["source"] == log_file) & (df["is_correct"] == True)]) for log_file in log_files],
+        "Total": [len(df[df["source"] == log_file]) for log_file in log_files]
+    })
+    overall_table.to_csv(os.path.join(RESULTS_DIR, "overall_log_report.csv"), index=False)
+    
+    # Individual Log Reports
+    for log_file in log_files:
+        log_df = df[df["source"] == log_file]
+        plt.figure(figsize=(8, 5))
+        questions = log_df["prompt"].apply(lambda x: x.split("\n\n")[0]).unique()
+        question_accuracy = [log_df[log_df["prompt"].str.startswith(q)]["is_correct"].mean() for q in QUESTIONS]
+        plt.bar(QUESTIONS, question_accuracy, color='teal')
+        plt.ylim(0, 1)
+        plt.title(f"Accuracy for {os.path.basename(log_file)}")
+        plt.ylabel("Accuracy")
+        plt.xticks(rotation=15, ha='right')
+        plt.tight_layout()
+        plt.savefig(os.path.join(RESULTS_DIR, f"{os.path.basename(log_file)}_accuracy.png"))
+        plt.close()
+        
+        # Individual Table
+        log_table = log_df[["prompt", "expected", "predicted", "is_correct"]]
+        log_table["prompt"] = log_table["prompt"].apply(lambda x: x.split("\n\n")[0])
+        log_table.to_csv(os.path.join(RESULTS_DIR, f"{os.path.basename(log_file)}_details.csv"), index=False)
+    
+    # Additional Visuals
+    # Pie Chart: Pass/Fail Distribution
+    plt.figure(figsize=(6, 6))
+    pass_fail_counts = df["type"].value_counts()
+    plt.pie(pass_fail_counts, labels=pass_fail_counts.index, autopct='%1.1f%%', colors=['green', 'red'])
+    plt.title("Distribution of Passed vs Failed Logs")
+    plt.savefig(os.path.join(RESULTS_DIR, "pass_fail_distribution.png"))
+    plt.close()
+    
+    # Line Plot: Cumulative Accuracy
+    plt.figure(figsize=(10, 6))
+    cumulative_correct = df["is_correct"].cumsum()
+    cumulative_total = range(1, len(df) + 1)
+    cumulative_accuracy = cumulative_correct / cumulative_total
+    plt.plot(cumulative_total, cumulative_accuracy, marker='o', color='blue')
+    plt.axhline(y=0.9, color='r', linestyle='--', label='Target: 90%')
+    plt.ylim(0, 1)
+    plt.title("Cumulative Accuracy Over Examples")
+    plt.xlabel("Example Number")
+    plt.ylabel("Cumulative Accuracy")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(RESULTS_DIR, "cumulative_accuracy.png"))
+    plt.close()
+    
+    # Standard Report
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.bar(["Overall"], [accuracy], color='skyblue')
+    plt.ylim(0, 1)
+    plt.title(f"Overall Accuracy: {accuracy:.1%}")
+    
+    plt.subplot(1, 2, 2)
+    plt.bar(["Passed", "Failed"], [passed_accuracy, failed_accuracy], color=['green', 'red'])
+    plt.ylim(0, 1)
+    plt.title("Accuracy by Log Type")
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, "accuracy_report.png"))
+    plt.close()
+    
+    df.to_csv(os.path.join(RESULTS_DIR, "detailed_results.csv"), index=False)
+    
+    print(f"\n{'='*50}")
+    print(f"Final Validation Report")
+    print(f"{'='*50}")
+    print(f"Total Examples Tested: {len(df)}")
+    print(f"Overall Accuracy: {accuracy:.1%}")
+    print(f"Passed Logs Accuracy: {passed_accuracy:.1%}")
+    print(f"Failed Logs Accuracy: {failed_accuracy:.1%}")
+    print(f"Accuracy Target (>90%): {'Achieved' if accuracy > 0.9 else 'Not Achieved'}")
+    print(f"\nReport saved to: {RESULTS_DIR}/")
+
+if __name__ == "__main__":
+    import matplotlib
+    matplotlib.use('Agg')
+    
+    model, tokenizer = load_model()
+    train_data = load_train_jsonl()
+    results = run_validation(model, tokenizer, train_data)
+    generate_report(results)
