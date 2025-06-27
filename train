@@ -1,0 +1,88 @@
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from datasets import load_dataset
+from peft import LoraConfig
+from trl import SFTTrainer
+import torch
+import os
+
+def formatting_func(examples):
+    """Proper batch processing of examples"""
+    if isinstance(examples, dict):
+        # Handle single example case
+        return [f"### Log: {examples['prompt']}\n### Analysis: {examples['completion']}"]
+    elif isinstance(examples, list):
+        # Handle batch processing
+        return [
+            f"### Log: {ex['prompt']}\n### Analysis: {ex['completion']}"
+            for ex in examples
+        ]
+    else:
+        raise ValueError("Unexpected input type to formatting_func")
+
+def main():
+    # Configuration
+    model_id = "meta-llama/Llama-2-7b-chat-hf"
+    dataset_path = "train.jsonl"
+    
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_id, token=os.getenv("HF_TOKEN"))
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    # Load model
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.float32,
+        device_map="cpu",
+        token=os.getenv("HF_TOKEN")
+    )
+    
+    # Prepare dataset
+    dataset = load_dataset("json", data_files=dataset_path)["train"]
+    dataset = dataset.train_test_split(test_size=0.1)
+    
+    # LoRA configuration
+    peft_config = LoraConfig(
+        r=4,
+        lora_alpha=8,
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=["q_proj", "v_proj"]
+    )
+    
+    # Training arguments
+    training_args = TrainingArguments(
+        output_dir="llama2_log_analyzer",
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
+        learning_rate=1e-5,
+        num_train_epochs=1,
+        logging_steps=10,
+        save_strategy="steps",
+        save_steps=100,
+        eval_strategy="no",
+        report_to="none",
+        use_cpu=True,
+        remove_unused_columns=True  # Changed to True to avoid warning
+    )
+    
+    # Initialize trainer with SFTConfig
+    trainer = SFTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset["train"],
+        peft_config=peft_config,
+        tokenizer=tokenizer,
+        formatting_func=formatting_func,
+        dataset_text_field="prompt",  # Explicit text field
+        max_seq_length=128
+    )
+    
+    # Start training
+    print("Starting training...")
+    trainer.train()
+    trainer.save_model("llama2_log_analyzer")
+    print("Training completed successfully")
+
+if __name__ == "__main__":
+    main()
