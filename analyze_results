@@ -1,0 +1,322 @@
+# import pandas as pd
+# import matplotlib
+# import matplotlib.pyplot as plt
+# import seaborn as sns
+# import os
+# from datetime import datetime
+# import glob
+# import numpy as np
+# from sklearn.metrics import precision_score, recall_score, f1_score
+# import matplotlib.font_manager as fm
+# from packaging import version
+
+# # Configuration
+# RESULTS_DIR = max(glob.glob("validation_*"), key=os.path.getmtime)
+# CSV_PATH = os.path.join(RESULTS_DIR, "detailed_results.csv")
+# VISUAL_DIR = "journal_visualizations_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+# PROMPTS = {
+#     "P1": "Does this log contain any errors?",
+#     "P2": "What is the main error message?",
+#     "P3": "What type of error is this?"
+# }
+# PROMPT_LABELS = ["P1", "P2", "P3"]
+
+# def load_results():
+#     if not os.path.exists(CSV_PATH):
+#         raise FileNotFoundError(f"Results file not found at {CSV_PATH}")
+#     df = pd.read_csv(CSV_PATH)
+#     # Simulate loss (binary cross-entropy approximation)
+#     df["loss"] = df["is_correct"].apply(lambda x: -np.log(0.9 if x else 0.1))
+#     # Map prompts to P1, P2, P3 for easier grouping
+#     df["prompt_label"] = df["prompt"].apply(lambda x: next(p for p, q in PROMPTS.items() if x.startswith(q)))
+#     return df
+
+# def set_journal_style(font_family="Times New Roman"):
+#     # Check available fonts
+#     available_fonts = set(f.name for f in fm.fontManager.ttflist)
+#     if font_family not in available_fonts:
+#         print(f"Font '{font_family}' not found. Falling back to 'DejaVu Sans'.")
+#         font_family = "DejaVu Sans"
+#     plt.rcParams.update({
+#         "font.family": font_family,
+#         "font.size": 8,
+#         "axes.titlesize": 8,
+#         "axes.labelsize": 8,
+#         "xtick.labelsize": 8,
+#         "ytick.labelsize": 8,
+#         "legend.fontsize": 8,
+#         "figure.dpi": 300,
+#         "axes.grid": True,
+#         "grid.linestyle": "--",
+#         "grid.alpha": 0.3
+#     })
+#     return font_family
+
+# def get_colormap(cmap_name, fallback="YlOrRd"):
+#     # Check available colormaps
+#     available_cmaps = set(matplotlib.colormaps.keys())
+#     if cmap_name.lower() not in available_cmaps:
+#         print(f"Colormap '{cmap_name}' not found. Falling back to '{fallback}'.")
+#         return fallback
+#     return cmap_name
+
+# def generate_journal_visualizations(df):
+#     os.makedirs(VISUAL_DIR, exist_ok=True)
+
+#     # Check Matplotlib version
+#     mpl_version = matplotlib.__version__
+#     if version.parse(mpl_version) < version.parse("3.5.0"):
+#         print(f"Warning: Matplotlib version {mpl_version} detected. Version 3.5.0 or higher is recommended for optimal font handling.")
+
+#     # Set style for bar chart and loss plot (Times New Roman or fallback)
+#     font_family = set_journal_style("Times New Roman")
+
+#     # Calculate metrics in points
+#     overall_accuracy = df["is_correct"].mean()
+#     passed_accuracy = df[df["type"] == "passed"]["is_correct"].mean()
+#     failed_accuracy = df[df["type"] == "failed"]["is_correct"].mean()
+#     prompt_accuracy = {PROMPTS[p]: df[df["prompt"].str.startswith(PROMPTS[p])]["is_correct"].mean() for p in PROMPT_LABELS}
+
+#     # Figure 1: Bar Chart with Error Bars - Accuracy by Log File and Prompt
+#     # Compute means and stds separately to avoid MultiIndex issues
+#     grouped = df.groupby([df["source"].apply(os.path.basename), "prompt_label"])["is_correct"]
+#     means = grouped.mean().unstack()
+#     stds = grouped.std().unstack()
+#     plt.figure(figsize=(3.5, 2.5))
+#     ax = means.plot(kind="bar", width=0.8, colormap="Set2", yerr=stds, capsize=3, edgecolor="black", linewidth=0.5)
+#     plt.title("Accuracy Across Prompts", weight="bold")
+#     plt.xlabel("Log File")
+#     plt.ylabel("Accuracy (Points, 0 to 1)")
+#     plt.ylim(0, 1.1)
+#     plt.xticks(rotation=45, ha="right")
+#     # Highlight highest accuracy
+#     max_val = means.max().max()
+#     max_idx = means.stack().idxmax()
+#     max_log, max_prompt = max_idx
+#     max_pos = list(means.index).index(max_log) + (PROMPT_LABELS.index(max_prompt) * 0.3 - 0.25)
+#     plt.text(max_pos, max_val + 0.05, f"{max_val:.2f}", ha="center", fontsize=8, weight="bold", color="red")
+#     plt.legend(labels=PROMPT_LABELS, title="Prompt", loc="upper left", bbox_to_anchor=(1, 1))
+#     plt.tight_layout()
+#     plt.savefig(os.path.join(VISUAL_DIR, "figure_1_accuracy_bar.png"), dpi=300, bbox_inches="tight")
+#     plt.close()
+
+#     # Figure 2: Heatmap with Gradient - Accuracy Across Logs vs. Prompts
+#     font_family = set_journal_style("Arial")
+#     log_accuracy = df.groupby([
+#         df["source"].apply(os.path.basename),
+#         "prompt_label"
+#     ])["is_correct"].mean()
+#     plt.figure(figsize=(7, 2.5))
+#     cmap = get_colormap("viridis", fallback="YlOrRd")
+#     sns.heatmap(log_accuracy.unstack(), annot=True, fmt=".2f", cmap=cmap, 
+#                 cbar_kws={"label": "Accuracy (Points)"}, linecolor="white", linewidths=0.5)
+#     plt.title("Accuracy Across Logs and Prompts", weight="bold")
+#     plt.xlabel("Prompt")
+#     plt.ylabel("Log File")
+#     plt.xticks(rotation=0)
+#     plt.tight_layout()
+#     plt.savefig(os.path.join(VISUAL_DIR, "figure_2_accuracy_heatmap.png"), dpi=300, bbox_inches="tight")
+#     plt.close()
+
+#     # Figure 3: Box Plot - Accuracy Distribution Across Prompts
+#     font_family = set_journal_style("Arial")
+#     plt.figure(figsize=(3.5, 2.5))
+#     sns.boxplot(x="prompt_label", y="is_correct", data=df, palette="Pastel1", 
+#                 boxprops=dict(edgecolor="black", linewidth=0.5), 
+#                 medianprops=dict(color="red", linewidth=2))
+#     plt.title("Distribution of Accuracy", weight="bold")
+#     plt.xlabel("Prompt")
+#     plt.ylabel("Accuracy (Points, 0 to 1)")
+#     plt.ylim(-0.1, 1.1)
+#     # Add mean points
+#     means = df.groupby("prompt_label")["is_correct"].mean()
+#     for i, (prompt, mean) in enumerate(means.items()):
+#         plt.text(i, mean + 0.05, f"{mean:.2f}", ha="center", fontsize=8, color="blue")
+#     plt.tight_layout()
+#     plt.savefig(os.path.join(VISUAL_DIR, "figure_3_accuracy_boxplot.png"), dpi=300, bbox_inches="tight")
+#     plt.close()
+
+#     # Figure 4: Stacked Loss Plot - Loss Contributions per Log
+#     font_family = set_journal_style("Times New Roman")
+#     loss_pivot = df.pivot_table(
+#         values="loss",
+#         index=df["source"].apply(os.path.basename),
+#         columns="prompt_label",
+#         aggfunc="mean"
+#     )
+#     plt.figure(figsize=(3.5, 2.5))
+#     loss_pivot.plot(kind="bar", stacked=True, colormap="Set3", edgecolor="black", linewidth=0.5)
+#     plt.title("Stacked Loss Contributions", weight="bold")
+#     plt.xlabel("Log File")
+#     plt.ylabel("Loss (Points)")
+#     plt.xticks(rotation=45, ha="right")
+#     plt.legend(labels=PROMPT_LABELS, title="Prompt", loc="upper left", bbox_to_anchor=(1, 1))
+#     plt.tight_layout()
+#     plt.savefig(os.path.join(VISUAL_DIR, "figure_4_stacked_loss.png"), dpi=300, bbox_inches="tight")
+#     plt.close()
+
+#     # Summary Table with Metrics
+#     metrics = []
+#     for p in PROMPT_LABELS:
+#         q = PROMPTS[p]
+#         q_df = df[df["prompt"].str.startswith(q)]
+#         if len(q_df) == 0:
+#             continue
+#         precision = precision_score(q_df["is_correct"], q_df["is_correct"], zero_division=0)
+#         recall = recall_score(q_df["is_correct"], q_df["is_correct"], zero_division=0)
+#         f1 = f1_score(q_df["is_correct"], q_df["is_correct"], zero_division=0)
+#         metrics.append({
+#             "Prompt": f"{p}: {q}",
+#             "Accuracy (Points)": q_df["is_correct"].mean(),
+#             "Precision (Points)": precision,
+#             "Recall (Points)": recall,
+#             "F1-Score (Points)": f1
+#         })
+#     metrics_df = pd.DataFrame(metrics)
+#     metrics_df["Accuracy (Points)"] = metrics_df["Accuracy (Points)"].apply(lambda x: f"{x:.3f}")
+#     metrics_df["Precision (Points)"] = metrics_df["Precision (Points)"].apply(lambda x: f"{x:.3f}")
+#     metrics_df["Recall (Points)"] = metrics_df["Recall (Points)"].apply(lambda x: f"{x:.3f}")
+#     metrics_df["F1-Score (Points)"] = metrics_df["F1-Score (Points)"].apply(lambda x: f"{x:.3f}")
+#     metrics_df.to_csv(os.path.join(VISUAL_DIR, "table_1_metrics.csv"), index=False)
+
+#     # Summary Report
+#     print(f"\n{'='*50}")
+#     print(f"Journal Visualization Report")
+#     print(f"{'='*50}")
+#     print(f"Visualizations saved to: {VISUAL_DIR}/")
+#     print(f"- figure_1_accuracy_bar.png")
+#     print(f"  Caption: Figure 1: Accuracy of log file analysis across prompts (P1–P3) with variability.")
+#     print(f"- figure_2_accuracy_heatmap.png")
+#     print(f"  Caption: Figure 2: Heatmap of accuracy across logs and prompts (P1–P3).")
+#     print(f"- figure_3_accuracy_boxplot.png")
+#     print(f"  Caption: Figure 3: Distribution of accuracy across prompts (P1–P3).")
+#     print(f"- figure_4_stacked_loss.png")
+#     print(f"  Caption: Figure 4: Stacked loss contributions per log file.")
+#     print(f"- table_1_metrics.csv")
+#     print(f"\nSummary:")
+#     print(f"Overall Accuracy: {overall_accuracy:.3f} points")
+#     print(f"Passed Logs Accuracy: {passed_accuracy:.3f} points")
+#     print(f"Failed Logs Accuracy: {failed_accuracy:.3f} points")
+#     for p, q in PROMPTS.items():
+#         acc = prompt_accuracy[q]
+#         print(f"Prompt {p} ('{q}') Accuracy: {acc:.3f} points")
+
+# if __name__ == "__main__":
+#     matplotlib.use("Agg")
+#     df = load_results()
+#     generate_journal_visualizations(df)
+
+
+
+# analyze_results.py (Enhanced Version)
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import os
+from datetime import datetime
+from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
+
+# Configuration
+RESULTS_DIR = max([d for d in os.listdir() if d.startswith("validation_")], key=os.path.getmtime)
+CSV_PATH = os.path.join(RESULTS_DIR, "detailed_results.csv")
+OUTPUT_DIR = "enhanced_analysis_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+PROMPTS = {
+    "P1": "Does this log contain any errors?",
+    "P2": "What is the main error message?",
+    "P3": "What type of error is this?"
+}
+
+# Load Results
+df = pd.read_csv(CSV_PATH)
+df["prompt_label"] = df["prompt"].apply(lambda x: next(p for p, q in PROMPTS.items() if x.startswith(q)))
+
+# Classification metrics for Prompt 1 (binary task)
+df_p1 = df[df["prompt_label"] == "P1"]
+
+def is_positive(label):
+    return isinstance(label, str) and label.lower() not in ["no", "no error", "no errors found", "no errors detected", "none"]
+
+y_true = df_p1["expected"].apply(is_positive)
+y_pred = df_p1["predicted"].apply(is_positive)
+
+TP = ((y_true == True) & (y_pred == True)).sum()
+TN = ((y_true == False) & (y_pred == False)).sum()
+FP = ((y_true == False) & (y_pred == True)).sum()
+FN = ((y_true == True) & (y_pred == False)).sum()
+
+accuracy = accuracy_score(y_true, y_pred)
+precision = precision_score(y_true, y_pred, zero_division=0)
+recall = recall_score(y_true, y_pred, zero_division=0)
+f1 = f1_score(y_true, y_pred, zero_division=0)
+
+# Save Confusion Matrix
+plt.figure(figsize=(5, 4))
+sns.heatmap(confusion_matrix(y_true, y_pred), annot=True, fmt="d", cmap="Blues",
+            xticklabels=["Pred: No Error", "Pred: Error"],
+            yticklabels=["Actual: No Error", "Actual: Error"])
+plt.title("Confusion Matrix - Prompt 1")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "confusion_matrix_prompt1.png"), dpi=300)
+plt.close()
+
+# Advanced Visualizations
+# 1. Accuracy by Prompt
+plt.figure(figsize=(6, 4))
+sns.barplot(data=df, x="prompt_label", y="is_correct", ci=None, palette="gray")
+plt.title("Prompt-wise Accuracy")
+plt.ylabel("Accuracy")
+plt.xlabel("Prompt")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "prompt_accuracy_bar.png"), dpi=300)
+plt.close()
+
+# 2. Accuracy per Log File per Prompt
+grouped = df.groupby([df["source"].apply(os.path.basename), "prompt_label"])["is_correct"].mean().unstack()
+plt.figure(figsize=(8, 4))
+grouped.plot(kind="bar", colormap="gray", edgecolor="black")
+plt.title("Accuracy by Log File and Prompt")
+plt.ylabel("Accuracy")
+plt.xticks(rotation=45, ha="right")
+plt.tight_layout()
+plt.savefig(os.path.join(OUTPUT_DIR, "accuracy_by_log_and_prompt.png"), dpi=300)
+plt.close()
+
+# 3. F1, Precision, Recall by Prompt
+summary = df.groupby("prompt_label")["is_correct"].agg(["mean"]).rename(columns={"mean": "accuracy"})
+for metric, func in zip(["precision", "recall", "f1"], [precision_score, recall_score, f1_score]):
+    scores = []
+    for p in PROMPTS.keys():
+        subset = df[df["prompt_label"] == p]
+        yt = subset["expected"].apply(is_positive)
+        yp = subset["predicted"].apply(is_positive)
+        score = func(yt, yp, zero_division=0)
+        scores.append(score)
+    summary[metric] = scores
+
+summary.round(3).to_csv(os.path.join(OUTPUT_DIR, "metrics_summary.csv"))
+
+# Save equations output as text
+equations_text = f"""
+Evaluation Metrics for Prompt 1 (Does this log contain any errors?):
+
+Equation (1): Accuracy = (TP + TN) / (TP + TN + FP + FN)
+             = ({TP} + {TN}) / ({TP} + {TN} + {FP} + {FN}) = {accuracy:.3f}
+
+Equation (2): Precision = TP / (TP + FP)
+             = {TP} / ({TP} + {FP}) = {precision:.3f}
+
+Equation (3): Recall = TP / (TP + FN)
+             = {TP} / ({TP} + {FN}) = {recall:.3f}
+
+Equation (4): F1-score = 2 * (Precision * Recall) / (Precision + Recall)
+             = 2 * ({precision:.3f} * {recall:.3f}) / ({precision:.3f} + {recall:.3f}) = {f1:.3f}
+"""
+with open(os.path.join(OUTPUT_DIR, "evaluation_equations.txt"), "w") as f:
+    f.write(equations_text.strip())
+
+print(f"✅ Analysis complete. Results saved to: {OUTPUT_DIR}")
+
