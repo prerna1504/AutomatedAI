@@ -1,0 +1,91 @@
+import json
+import os
+import re
+from pathlib import Path
+
+def create_dataset(logs_dir="logs", output_file="train.jsonl"):
+    questions = [
+        "Does this log contain any errors?",
+        "What is the main error message?",
+        "What type of error is this?"
+    ]
+    
+    with open(output_file, "w") as out:
+        for category in ["failed", "passed"]:
+            log_dir = os.path.join(logs_dir, category)
+            if not os.path.exists(log_dir):
+                continue
+                
+            for log_file in Path(log_dir).glob("*.log"):
+                with open(log_file, "r") as f:
+                    log_content = f.read().strip()
+                
+                is_error_log = category == "failed"
+                
+                for question in questions:
+                    if question == "Does this log contain any errors?":
+                        answer = "YES" if is_error_log else "NO"
+                    elif question == "What is the main error message?":
+                        answer = extract_main_error(log_content) if is_error_log else "No errors found"
+                    elif question == "What type of error is this?":
+                        answer = classify_error(log_content) if is_error_log else "No errors detected"
+                    
+                    # Write the QA pair
+                    out.write(json.dumps({
+                        "prompt": f"{question}\n\n{log_content}",
+                        "completion": answer
+                    }) + "\n")
+
+def extract_main_error(log_content):
+    """Extracts the first ERROR-level message from the log"""
+    for line in log_content.split('\n'):
+        if "ERROR" in line:
+            return line.strip()
+    return "Unknown error"
+
+def classify_error(log_content):
+    """Classifies errors with codes and specific types"""
+    error_lines = [line for line in log_content.split('\n') if "ERROR" in line]
+    if not error_lines:
+        return "Unknown error"
+    
+    first_error = error_lines[0]
+    error_code = extract_error_code(first_error)
+    
+    # Database errors
+    if "mysql down" in first_error or "DB connection" in first_error:
+        return f"Database Error ({error_code})"
+    
+    # Network errors
+    elif "Ping failed" in first_error:
+        return f"Network Timeout ({error_code})"
+    elif "Connection dropped" in first_error:
+        return "Connection Error"
+    
+    # Resource errors
+    elif "404" in first_error or "Fetch failed" in first_error:
+        return "Resource Not Found (404)"
+    
+    # System errors
+    elif "Segmentation fault" in first_error:
+        return "System Error (Segmentation Fault)"
+    
+    # Configuration errors
+    elif "Config failed" in first_error:
+        return f"Configuration Error ({error_code})"
+    
+    return "Application Error"
+
+def extract_error_code(error_line):
+    """Extracts error code from JSON-like patterns"""
+    match = re.search(r'\{.*?"error_code":\s*(\d+)', error_line)
+    return match.group(1) if match else None
+
+# def extract_error_code(error_line):
+#     """Extracts error code from JSON-like patterns (e.g., { "error_code": 503 })"""
+#     match = re.search(r'\{"error_code":\s*(\d+)', error_line)
+#     return match.group(1) if match else None
+
+if __name__ == "__main__":
+    create_dataset()
+    print("✅ Training data created as train.jsonl")
